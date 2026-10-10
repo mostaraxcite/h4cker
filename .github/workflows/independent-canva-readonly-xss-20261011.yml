@@ -1,0 +1,72 @@
+name: Independent Canva read-only XSS canary
+on:
+  push:
+    branches:
+      - research/canva-readonly-canary-20261011
+    paths:
+      - .github/workflows/independent-canva-readonly-xss-20261011.yml
+permissions:
+  contents: read
+jobs:
+  safe-canary-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Probe public pages without payload execution or WAF bypass
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, time, urllib.request, urllib.parse, urllib.error, re, html
+          MARK='BB_CANARY_20261011_Q7T'
+          TAG='BB_CANARY_20261011_TAG'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*a,**kw): return None
+          client=urllib.request.build_opener(NoRedirect)
+          targets=['www.canva.com','alpha.canva.com']
+          harmless='"'+"<"+TAG+">"
+          cases=[
+              ('search-plain','/search?q='+urllib.parse.quote(MARK)),
+              ('search-safe-markup','/search?q='+urllib.parse.quote(harmless,safe='')),
+              ('templates-plain','/s/templates?query='+urllib.parse.quote(MARK)),
+              ('templates-safe-markup','/s/templates?query='+urllib.parse.quote(harmless,safe='')),
+              ('login-next-plain','/login?next='+urllib.parse.quote('/search?q='+MARK,safe='')),
+          ]
+          for host in targets:
+              for name,path in [('baseline','/'),*cases]:
+                  # Strict host allowlist, no redirects, no authentication or state-changing requests.
+                  req=urllib.request.Request('https://'+host+path,headers={
+                      'User-Agent':'Canva-Responsible-Research/1.0 (read-only validation)',
+                      'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.6',
+                  },method='GET')
+                  status=0; body=''; headers={}
+                  try:
+                      with client.open(req,timeout=10) as resp:
+                          status=resp.status;headers=dict(resp.headers.items())
+                          body=resp.read(300000).decode('utf-8','replace')
+                  except urllib.error.HTTPError as e:
+                      status=e.code;headers=dict(e.headers.items())
+                      body=e.read(300000).decode('utf-8','replace')
+                  except Exception as e:
+                      print('CANVA_SAFE_PROBE='+json.dumps({'host':host,'case':name,'status':'network_error','kind':type(e).__name__}))
+                      break
+                  lower=body.lower()
+                  cf=any(s in lower for s in ('__cf_chl_tk','cf-challenge','challenge-platform','just a moment','verify you are human','checking your browser'))
+                  escaped=html.escape(harmless,quote=True) in body or '&lt;'+TAG+'&gt;' in body
+                  result={
+                      'host':host,'case':name,'http_status':status,
+                      'response_type':headers.get('Content-Type',headers.get('content-type',''))[:60],
+                      'bytes_analyzed':len(body.encode('utf-8')),
+                      'cloudflare_challenge':cf,
+                      'marker_raw':MARK in body if name.endswith('plain') else False,
+                      'safe_markup_raw':harmless in body if 'markup' in name else False,
+                      'safe_markup_html_encoded':escaped if 'markup' in name else False,
+                      'safe_markup_url_encoded':('%3C'+TAG+'%3E').lower() in body.lower() if 'markup' in name else False,
+                  }
+                  # A canary reflection or non-execution never constitutes proven XSS.
+                  print('CANVA_SAFE_PROBE='+json.dumps(result,ensure_ascii=True),flush=True)
+                  if status in (403,429) or cf:
+                      print('CANVA_SAFE_STOP='+json.dumps({'host':host,'reason':'WAF_or_rate_limit','case':name}),flush=True)
+                      break
+                  time.sleep(2.5)
+          print('CANVA_SAFE_DONE=1')
+          PY
